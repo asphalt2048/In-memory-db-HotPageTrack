@@ -173,9 +173,12 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
     }
 
     /* must update TT at the end. */
-    new_loc.in_use.is_in_ram = true;
-    new_loc.in_use.size = record_size;
-    new_loc.in_use.ram_addr = new_slot_addr;
+    size_t lock_idx = new_logical_id % TT_SHARDS;
+    std::unique_lock<std::shared_mutex> write_lock(tt_locks[lock_idx]);
+
+    translation_table[new_logical_id].in_use.is_in_ram = true;
+    translation_table[new_logical_id].in_use.size = record_size;
+    translation_table[new_logical_id].in_use.ram_addr = new_slot_addr;
 
     return true;
 }
