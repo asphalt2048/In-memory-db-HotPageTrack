@@ -102,7 +102,6 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
     /* DB interface must pre alloc space before holding TT's lock.
      * Otherwise there will be deadlock when OOM happens.
      */
-    // TODO: this is a bad design
     SizeClassManager &scm = SCMs[get_scm_index(real_size)];
     void* pre_alloc_slot = scm.alloc();
 
@@ -118,26 +117,28 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
 
     /* case 1: record is in ram */
     if(loc.in_use.is_in_ram){
-        void* slot_addr = loc.in_use.ram_addr;
-        size_t old_size = get_struct_page(slot_addr)->header.slot_size;
+        void* old_slot_addr = loc.in_use.ram_addr;
+        size_t old_size = get_struct_page(old_slot_addr)->header.slot_size;
+        SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
 
         /* case 1.1: New data fits in the existing slot. Update in-place. */
-        if( real_size <= old_size){ // TODO: reallocate
+        if(scm.get_slot_size() == old_scm.get_slot_size()){
             scm.free(pre_alloc_slot);
-            fill_slot_nocheck(slot_addr, logical_id, record, record_size);
-            promote_a_slot(slot_addr);
+
+            fill_slot_nocheck(old_slot_addr, logical_id, record, record_size);
+            promote_a_slot(old_slot_addr);
             loc.in_use.size = record_size;
             return true;
         }
-        /* case 1.2: New data outgrows the current slot. Reallocate. */
+        /* case 1.2: New data outgrows/downgrow the current slot. Reallocate. */
         else{
-            // TODO: do we need rollback?
+            // copy data to new slot.
             fill_slot_nocheck(pre_alloc_slot, logical_id, record, record_size);
             promote_a_slot(pre_alloc_slot);
 
-            SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
-            mark_slot_cold(slot_addr);
-            old_scm.free(slot_addr);            
+            // mark old slot cold before free.
+            mark_slot_cold(old_slot_addr);
+            old_scm.free(old_slot_addr);            
 
             loc.in_use.ram_addr = pre_alloc_slot;
             loc.in_use.size = record_size;
@@ -176,6 +177,7 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
      */
     bool success = hashmap.insert(key, new_logical_id, collided_id);
     if(!success){ // roll back
+        mark_slot_cold(new_slot_addr);
         scm.free(new_slot_addr);
         remove_from_table(new_logical_id);
         return false;
@@ -292,7 +294,7 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
     } 
 
     // recheck record size here. an update + evict sequence could make old size invalid
-    if (loc.in_use.size != record_size) {
+    if (get_scm_index(record_size + sizeof(RecordHeader)) != get_scm_index(loc.in_use.size + sizeof(RecordHeader))){
         scm.free(pre_alloc_slot);
         write_lock.unlock();
         return get(key, buf, out_record_size);
@@ -337,6 +339,7 @@ bool StorageEngine::del(const std::string& key){
         Page* page = get_struct_page(slot_addr);
         size_t slot_size = page->header.slot_size;
 
+        mark_slot_cold(slot_addr);
         SCMs[get_scm_index(slot_size)].free(slot_addr);
     } 
     /* record is in disk, logical delete */
@@ -359,20 +362,6 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
     SizeClassManager &scm = SCMs[get_scm_index(victim_page->header.slot_size)];
     // flag, determine how aggresive sweeper acts
     bool is_critical = arena.is_critical();
-
-    /* There is a TOCTOU bug, that the victim page become empty and returned to arena before 
-     * sweeper is able to evict it. 
-     * The page might has been allocated to another SCM before we are able to quarantine it.
-     * The current fix is doing a double check inside scm.quarantine_page(), which is not elegant
-     * SUGGESTION: add a generation count in pageheader, that is increased each time page get allocated
-     */
-
-    // isolate the page so that no insert will use this page. And no free can change
-    // the page's lru pointers and partial list pointers.
-    bool success = scm.quarantine_page(victim_page);
-    if(!success){
-        return;
-    }
 
     uint16_t max_slots = victim_page->header.max_slots;
 
@@ -438,6 +427,7 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
                         set_slot_hotness(new_slot_addr, hotness);
 
                         clear_allocated_bit(victim_page, slot_idx);
+                        mark_slot_cold(slot_addr);
                         victim_page->header.used.fetch_sub(1);
                         // debug
                         hot_rescued_count.fetch_add(1, std::memory_order_relaxed);
@@ -452,28 +442,14 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
                 loc.in_use.disk_offset = disk_offset;
 
                 clear_allocated_bit(victim_page, slot_idx);
+                mark_slot_cold(slot_addr);
                 victim_page->header.used.fetch_sub(1);
+            }else{
+                continue; // slot is partial in-use, let it go.
             }
+        }else{
+            continue; // logical id is out of bound, meaning it's a partial in-use slot. Let it go.
         }
-    }
-    /* decide whether the victim page should be linked back to partial list, or return to arena 
-     * (1) If page is not fully cleared, e.g. try_lock failed, or meet a partial in use page that eventually in-use
-     *      link the page back to partial list
-     * (2) If the page is fully cleared, return it to arena
-     */
-    Status status = scm.unquarantine_page(victim_page);
-    switch (status)
-    {
-    case FULL_PAGE_EVICTED:
-        whole_page_evicted_count.fetch_add(1, std::memory_order_relaxed);
-        break;
-    case PARTIAL_PAGE_EVICTED:
-        partial_page_evicted_count.fetch_add(1, std::memory_order_relaxed);
-        break;
-    default:
-        std::cerr<<RED<<"FATAL: unquarantine page meets undefined status\n"<<RESET;
-        exit(-1);
-        break;
     }
 }
 
@@ -481,7 +457,23 @@ void StorageEngine::evict_cold_page() {
     while (true) {
         Page* victim_page = reinterpret_cast<Page*>(arena.get_lru_tail());
         if (!victim_page) return; 
+        //debug
+        check_page_count.fetch_add(1, std::memory_order_relaxed);
 
+        /* There is a TOCTOU bug, that the victim page become empty and returned to arena before 
+         * sweeper is able to evict it. 
+         * The page might has been allocated to another SCM before we are able to quarantine it.
+         * The current fix is doing a double check inside scm.quarantine_page(), which is not elegant
+         * SUGGESTION: add a generation count in pageheader, that is increased each time page get allocated
+         */
+
+        SizeClassManager &scm = SCMs[get_scm_index(victim_page->header.slot_size)];
+        // isolate the page so that no insert will use this page. And no free can change
+        // the page's lru pointers and partial list pointers.
+        bool success = scm.quarantine_page(victim_page);
+        if(!success){
+            continue;
+        }
         uint16_t max_slots = victim_page->header.max_slots;
         
 
@@ -491,12 +483,32 @@ void StorageEngine::evict_cold_page() {
          * the page is lifted to the head of lru. And all hot bits are cleared
           ======================================================================= */
         uint16_t hot_count = age_and_get_page_hot_count(victim_page);
-        if (hot_count > (max_slots / PAGE_HOT_SCALE)){
-            arena.lift_in_lru(victim_page);
+        if (hot_count > (max_slots * PAGE_HOT_SCALE)){
+            scm.unquarantine_page(victim_page);
             continue; 
         }
         /* page selected as evcition target */
         page_hot_rescue(victim_page);
+
+        /* decide whether the victim page should be linked back to partial list, or return to arena 
+         * (1) If page is not fully cleared, e.g. try_lock failed, or meet a partial in use page that eventually in-use
+         *      link the page back to partial list
+         * (2) If the page is fully cleared, return it to arena
+         */
+        Status status = scm.unquarantine_page(victim_page);
+        switch (status)
+        {
+        case FULL_PAGE_EVICTED:
+            whole_page_evicted_count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case PARTIAL_PAGE_EVICTED:
+            partial_page_evicted_count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        default:
+            std::cerr<<RED<<"FATAL: unquarantine page meets undefined status\n"<<RESET;
+            exit(-1);
+            break;
+        }
 
         if(arena.is_safe()){
             break;

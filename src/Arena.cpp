@@ -69,6 +69,11 @@ void* Arena::alloc_a_page(){
         sweeper_cv.notify_one();
         std::this_thread::yield();
     }
+
+    // backpressure
+    if (needs_sweeping()){
+        std::this_thread::sleep_for(std::chrono::microseconds(1)); 
+    }
     
     /* allocation should be OK with direct reclamation ahead */
     void* page = alloc_a_page_nocheck();

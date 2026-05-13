@@ -8,7 +8,8 @@
 #include <algorithm>
 #include <numeric>
 #include <iomanip>
-#include <cstring> // For memset and memcpy
+#include <cstring>
+#include <filesystem>
 
 #include "StorageEngine.h" 
 
@@ -242,12 +243,16 @@ void telemetry_worker(StorageEngine* db) {
 // 7. THE MAIN HARNESS
 // ============================================================================
 int main() {
+    std::filesystem::remove("../data/imdb.aof");
+
     std::cout << "========================================================\n";
     std::cout << "   IMDB Benchmark (Dynamic Sizes - YCSB Workload B)     \n";
     std::cout << "========================================================\n";
 
     BenchConfig config;
-    StorageEngine db; 
+    DBConfig db_config;
+    db_config.arena_size = 1024 * 1024 * 64; // chenge this when needed
+    StorageEngine db(db_config); 
 
     load_database(db, config);
 
@@ -288,6 +293,22 @@ int main() {
         if (metrics[i].max_latency_us > global_max_latency) global_max_latency = metrics[i].max_latency_us;
     }
 
+    std::cout << "\n[Phase 5] Running validation sweep...\n";
+    uint64_t validation_success = 0;
+    char val_buf[256];
+    uint64_t val_size;
+    
+    for (uint64_t i = 1; i <= 10000; i++) {
+        std::string key = "user:" + std::to_string(i);
+        if (db.get(key, val_buf, val_size)) {
+            if (verify_payload(i, val_buf, val_size)) validation_success++;
+        }
+    }
+    
+    std::cout << "Validation: " << validation_success << " / 10000 initial records securely verified.\n";
+    if (validation_success == 10000 && total_corruptions == 0) std::cout << "Status: PASS (No data corruption detected!)\n\n";
+    else std::cout << "\033[31mStatus: FAIL (Data corruption or lost records detected!)\033[0m\n\n";
+
     double ops_per_second = (double)total_ops / config.measure_seconds;
     double avg_latency = total_ops > 0 ? (total_latency_sum / total_ops) : 0;
 
@@ -312,25 +333,30 @@ int main() {
               << critical_percent << "% of the time (" 
               << critical_samples << " / " << telemetry_samples << " ms)\n";
 
-    std::cout << "\n[Phase 5] Running validation sweep...\n";
-    uint64_t validation_success = 0;
-    char val_buf[256];
-    uint64_t val_size;
-    
-    for (uint64_t i = 1; i <= 10000; i++) {
-        std::string key = "user:" + std::to_string(i);
-        if (db.get(key, val_buf, val_size)) {
-            if (verify_payload(i, val_buf, val_size)) validation_success++;
-        }
-    }
-    
-    std::cout << "Validation: " << validation_success << " / 10000 initial records securely verified.\n";
-    if (validation_success == 10000 && total_corruptions == 0) std::cout << "Status: PASS (No data corruption detected!)\n\n";
-    else std::cout << "\033[31mStatus: FAIL (Data corruption or lost records detected!)\033[0m\n\n";
+    // --- EVICTION STATS ANALYSIS ---
+    uint64_t hot_rescued = db.hot_rescued_count.load();
+    uint64_t whole_evicted = db.whole_page_evicted_count.load();
+    uint64_t partial_evicted = db.partial_page_evicted_count.load();
+    uint64_t total_scanned = db.check_page_count.load();
 
-    std::cout<<"Hot rescued record: "<<db.hot_rescued_count.load()<<"\n";
-    std::cout<<"Whole page evicted count: "<<db.whole_page_evicted_count.load()<<"\n";
-    std::cout<<"Partial page evicted count: "<<db.partial_page_evicted_count.load()<<"\n";
+    // The arena capacity in pages (based on your 64MB / 4KB config)
+    const uint64_t arena_pages = db_config.arena_size / 4096; 
+    
+    double iterations = (double)total_scanned / arena_pages;
+    double candidate_pct = total_scanned > 0 ? ((double)(whole_evicted + partial_evicted) / total_scanned) * 100.0 : 0;
+    double eviction_ratio = partial_evicted > 0 ? (double)whole_evicted / partial_evicted : (double)whole_evicted;
+
+    std::cout << "=========================================================\n";
+    std::cout << "Eviction Stats:\n";
+    std::cout << "Hot rescued record:         " << hot_rescued << "\n";
+    std::cout << "Whole page evicted count:   " << whole_evicted << "\n";
+    std::cout << "Partial page evicted count: " << partial_evicted << "\n";
+    std::cout << "Check page count:           " << total_scanned << "\n";
+    std::cout << "---------------------------------------------------------\n";
+    std::cout << "Arena Revolutions:          " << std::fixed << std::setprecision(2) << iterations << "x\n";
+    std::cout << "Eviction Success Rate:      " << candidate_pct << "% (Evicted/Scanned)\n";
+    std::cout << "Whole/Partial Ratio:        " << eviction_ratio << ":1\n";
+    std::cout << "=========================================================\n";
 
     return 0;
 }

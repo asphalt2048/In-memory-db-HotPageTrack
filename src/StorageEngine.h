@@ -59,7 +59,7 @@ struct RecordHeader{
 
 /* config object*/
 struct DBConfig{
-    std::string db_file_path = "../data/imdb.aof";
+    std::string db_file_path = "./data/imdb.aof";
     uint8_t table_grow_speed = 2;
     size_t arena_size = 1024 * 1024 * 512; // default 512MB
     bool enable_hot_rescue = 1;
@@ -123,6 +123,7 @@ class StorageEngine{
     public:
         // debug:
         std::atomic<uint64_t> hot_rescued_count{0};
+        std::atomic<uint64_t> check_page_count{0};
         std::atomic<uint64_t> whole_page_evicted_count{0};
         std::atomic<uint64_t> partial_page_evicted_count{0};
         bool is_arena_critical() const { return arena.is_critical(); }

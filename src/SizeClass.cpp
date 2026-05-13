@@ -372,7 +372,7 @@ uint16_t age_and_get_page_hot_count(Page* page){
                 chunk_hot += val; // Count the hotness
                 
                 if(val > 0) val--; // Age the record
-                new_arr |= (static_cast<uint64_t>(val) << bit_shift); // Safely pack it
+                new_arr |= (static_cast<uint64_t>(val) << bit_shift);
             }
             
             if(page->is_hot[i].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){

@@ -52,5 +52,5 @@ test:
 # ==========================================
 clean:
 	rm -f build/db_bench build/db_bench_debug build/db_test
-	rm -f ../data/imdb.aof
+	rm -f ./data/imdb.aof
 	@echo "Cleaned build artifacts."

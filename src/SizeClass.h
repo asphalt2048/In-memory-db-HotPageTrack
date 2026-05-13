@@ -60,6 +60,8 @@ class SizeClassManager{
         SizeClassManager(uint16_t slot_size, Arena& arena): slot_size(slot_size), arena(arena) {partial_list_head = nullptr;}
         ~SizeClassManager() = default;
         
+        uint16_t get_slot_size() const { return slot_size; }
+
         /* alloate a slot, if page becomes full, stop tracking the page
          * will ask arena for new page if needed, might sleep. Not supposed to fail
          */
