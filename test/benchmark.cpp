@@ -158,9 +158,9 @@ void load_database(StorageEngine& db, BenchConfig& config) {
         bool success = db.put(key, payload_buffer, dynamic_size);
         if(!success) dropped_records++;
         
-        if (i % (config.num_records / 10) == 0) {
-            std::cout << "  ... " << (i * 100) / config.num_records << "% loaded.\n";
-        }
+        // if (i % (config.num_records / 10) == 0) {
+        //     std::cout << "  ... " << (i * 100) / config.num_records << "% loaded.\n";
+        // }
     }
     if (dropped_records > 0) {
         std::cout << "[WARNING] Arena OOM during load! Dropped " << dropped_records << " records.\n";
@@ -242,17 +242,35 @@ void telemetry_worker(StorageEngine* db) {
 // ============================================================================
 // 7. THE MAIN HARNESS
 // ============================================================================
-int main() {
-    std::filesystem::remove("../data/imdb.aof");
-
-    std::cout << "========================================================\n";
-    std::cout << "   IMDB Benchmark (Dynamic Sizes - YCSB Workload B)     \n";
-    std::cout << "========================================================\n";
+int main(int argc, char* argv[]) {
+    std::filesystem::remove("./data/imdb.aof");
 
     BenchConfig config;
     DBConfig db_config;
-    db_config.arena_size = 1024 * 1024 * 64; // chenge this when needed
-    StorageEngine db(db_config); 
+    db_config.arena_size = 1024 * 1024 * 64; // Default 64MB
+    db_config.page_hot_scale = 1;            // Default scale
+    db_config.age_record_speed = 1;          // Default age speed
+
+    // --- Simple CLI Parser ---
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--arena-mb" && i + 1 < argc) {
+            db_config.arena_size = std::stoull(argv[++i]) * 1024 * 1024;
+        } else if (arg == "--hot-scale" && i + 1 < argc) {
+            db_config.page_hot_scale = std::stoi(argv[++i]);
+        } else if (arg == "--age-speed" && i + 1 < argc) {
+            db_config.age_record_speed = std::stoi(argv[++i]);
+        }
+    }
+
+    std::cout << "========================================================\n";
+    std::cout << "   IMDB Benchmark (Dynamic Sizes - YCSB Workload B)     \n";
+    std::cout << "   Config: " << (db_config.arena_size / 1024 / 1024) << "MB Arena | "
+              << "Scale: " << db_config.page_hot_scale << " | "
+              << "AgeSpeed: " << db_config.age_record_speed << "\n";
+    std::cout << "========================================================\n";
+
+    StorageEngine db(db_config);
 
     load_database(db, config);
 

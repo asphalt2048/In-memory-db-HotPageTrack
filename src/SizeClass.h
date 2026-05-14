@@ -88,7 +88,7 @@ void set_slot_hotness(void* slot_addr, uint8_t exact_val);
 // return the total is_hot count
 uint16_t get_page_hot_count(Page* page);
 // also do '-1' on is_hot
-uint16_t age_and_get_page_hot_count(Page* page);
+uint16_t age_and_get_page_hot_count(Page* page, uint8_t age_speed);
 // clear is_hot
 void clear_page_hot_bits(Page* page);
 

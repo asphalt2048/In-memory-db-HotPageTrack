@@ -13,7 +13,9 @@ StorageEngine::StorageEngine(const DBConfig &cfg):
     disk_manager(config.db_file_path),
     SCMs{{16, arena}, {32, arena}, {64, arena}, {128, arena}, {256, arena}},
     sweeper(arena, [this](){this->evict_cold_page();}),
-    next_logical_id(0)
+    next_logical_id(0),
+    page_hot_scale(cfg.page_hot_scale),
+    age_record_speed(cfg.age_record_speed)
 {
     translation_table.resize(TABLE_SIZE);
     for(int i = 0; i<TABLE_SIZE-1; i++){ translation_table[i].next_free_idx = i + 1; }
@@ -413,7 +415,7 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
                 size_t total_size = loc.in_use.size + sizeof(RecordHeader);
                 uint8_t hotness = get_slot_hotness(slot_addr);
                 // --- BEST EFFORT RESCUE ---
-                if (config.enable_hot_rescue && hotness >= SLOT_HOT_THRESHOLD){
+                if (config.enable_hot_rescue && hotness >= 3 - age_record_speed){
                     /* TRY to ask free space in SCM. Might fail. 
                      * If fail, let the record die(write to disk).
                      *
@@ -482,10 +484,13 @@ void StorageEngine::evict_cold_page() {
          * If a page have (hot records > max_slot/PAGE_HOT_SCALE), give it a second chance.
          * the page is lifted to the head of lru. And all hot bits are cleared
           ======================================================================= */
-        uint16_t hot_count = age_and_get_page_hot_count(victim_page);
-        if (hot_count > (max_slots * PAGE_HOT_SCALE)){
-            scm.unquarantine_page(victim_page);
-            continue; 
+
+        if(true){ //debug
+            uint16_t hot_count = age_and_get_page_hot_count(victim_page, age_record_speed);
+            if (hot_count > (max_slots * page_hot_scale)){
+                scm.unquarantine_page(victim_page);
+                continue; 
+            }
         }
         /* page selected as evcition target */
         page_hot_rescue(victim_page);

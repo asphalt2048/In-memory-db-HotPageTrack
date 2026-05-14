@@ -72,7 +72,7 @@ void* Arena::alloc_a_page(){
 
     // backpressure
     if (needs_sweeping()){
-        std::this_thread::sleep_for(std::chrono::microseconds(1)); 
+        // std::this_thread::sleep_for(std::chrono::microseconds(1)); 
     }
     
     /* allocation should be OK with direct reclamation ahead */

@@ -357,7 +357,7 @@ uint16_t get_page_hot_count(Page* page) {
     return total_hot;
 }
 
-uint16_t age_and_get_page_hot_count(Page* page){
+uint16_t age_and_get_page_hot_count(Page* page, uint8_t age_speed){
     uint16_t total_hot = 0;
     
     for(int i=0; i < IS_HOT_ARR_LENGTH; i++){
@@ -371,7 +371,9 @@ uint16_t age_and_get_page_hot_count(Page* page){
                 uint8_t val = (old_arr>>bit_shift) & 0b11ULL;
                 chunk_hot += val; // Count the hotness
                 
-                if(val > 0) val--; // Age the record
+                for(int j=0; j<age_speed; j++){
+                    if(val > 0) val--; // Age the record
+                }
                 new_arr |= (static_cast<uint64_t>(val) << bit_shift);
             }
             

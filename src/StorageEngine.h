@@ -12,8 +12,6 @@
 #include "ShardedHashmap.h"
 
 namespace imdb{
-#define PAGE_HOT_SCALE 1
-#define SLOT_HOT_THRESHOLD 2
 #define TABLE_END  0XFFFFFFFFFFFFFFFF
 
 // TODO: will the FIFO feature of TT makes this inefficient?
@@ -60,9 +58,11 @@ struct RecordHeader{
 /* config object*/
 struct DBConfig{
     std::string db_file_path = "./data/imdb.aof";
-    uint8_t table_grow_speed = 2;
+    // uint8_t table_grow_speed = 2;
     size_t arena_size = 1024 * 1024 * 512; // default 512MB
     bool enable_hot_rescue = 1;
+    uint8_t age_record_speed = 1;
+    uint8_t page_hot_scale = 1;
 };
 
 /* StorageEngine, the highest level interface, provides put, get and delete. 
@@ -92,6 +92,9 @@ class StorageEngine{
        
         /* tracks key -> translation_table index mappings */
         ShardedHashMap hashmap;
+
+        uint8_t page_hot_scale;
+        uint8_t age_record_speed;
 
         void evict_cold_page();
         /* rescue hot record, and write other records to disk.*/
