@@ -15,6 +15,20 @@
 
 using namespace imdb;
 
+bool FULL_LATENCY_TRACKING = true;
+
+// ============================================================================
+// SAMPLING CONFIGURATION (Change these to toggle strategies!)
+// ============================================================================
+
+// If tracking is 'false', we sample 1 out of every (SAMPLE_MASK + 1) operations.
+// 0xFF = 255 (samples 1 in 256). 0x3FF = 1023 (samples 1 in 1024).
+constexpr uint64_t SAMPLE_MASK = 0xFF; 
+constexpr uint64_t SAMPLE_MULTIPLIER = SAMPLE_MASK + 1;
+
+// Automatically sizes the vector based on your tracking choice
+size_t VECTOR_CAPACITY = FULL_LATENCY_TRACKING ? 50000000 : 200000;
+
 // ============================================================================
 // 1. HIGH RESOLUTION TIMER
 // ============================================================================
@@ -25,6 +39,11 @@ struct Timer {
         start_time = std::chrono::high_resolution_clock::now();
     }
     
+    double elapsed_ns() { 
+        auto end_time = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    }
+
     double elapsed_us() { 
         auto end_time = std::chrono::high_resolution_clock::now();
         return std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count();
@@ -70,6 +89,11 @@ public:
 // ============================================================================
 // 3. BENCHMARK CONFIGURATION
 // ============================================================================
+// Set to 'true' to record 100% of operations (Requires ~3.2GB RAM, absolute best P99 accuracy).
+// Set to 'false' to use bitwise sampling (Requires ~6MB RAM, slightly more sensitive to OS jitter).
+constexpr size_t SIZE_RANGE_START = 20;
+constexpr size_t SIZE_RANGE_END = 248;
+
 struct BenchConfig {
     uint64_t num_records = 1000000;    
     int num_threads = 8;               
@@ -95,6 +119,8 @@ struct alignas(64) ThreadMetrics {
 enum class BenchState { WARMUP, MEASURE, DONE };
 std::atomic<BenchState> global_bench_state{BenchState::WARMUP};
 
+std::vector<size_t> global_record_sizes;
+
 // ============================================================================
 // 4. DYNAMIC SELF-VALIDATING PAYLOAD HELPERS
 // ============================================================================
@@ -114,21 +140,16 @@ void generate_payload(uint64_t key_id, bool is_update, char* buffer, size_t targ
 }
 
 bool verify_payload(uint64_t expected_id, const char* buffer, size_t actual_size) {
-    // 1. Check Bounds
     if (actual_size < 16 || actual_size > 256) return false; 
-    
-    // 2. Check Boundary Marker
     if (buffer[actual_size - 1] != '#') return false; 
 
-    // 3. Check Identity Prefix
     std::string expected_prefix = "K" + std::to_string(expected_id);
     if (std::memcmp(buffer, expected_prefix.c_str(), expected_prefix.length()) != 0) {
         return false;
     }
 
-    // 4. Strict Padding Scan (Catches overlapping writes from other records)
     char expected_pad = static_cast<char>((expected_id % 10) + '0');
-    size_t start_pad_idx = expected_prefix.length() + 1; // skip 'U' or 'I'
+    size_t start_pad_idx = expected_prefix.length() + 1; 
     for (size_t i = start_pad_idx; i < actual_size - 1; i++) {
         if (buffer[i] != expected_pad) return false;
     }
@@ -137,24 +158,26 @@ bool verify_payload(uint64_t expected_id, const char* buffer, size_t actual_size
 }
 
 // ============================================================================
-// 5. THE LOAD PHASE (DYNAMIC SIZES)
+// 5. THE LOAD PHASE 
 // ============================================================================
 void load_database(StorageEngine& db, BenchConfig& config) {
-    std::cout << "[Load Phase] Sequentially inserting " << config.num_records << " records with random sizes...\n";
+    global_record_sizes.resize(config.num_records + 1);
+
+    std::cout << "[Load Phase] Sequentially inserting " << config.num_records << " records with random sizes"<<"\n"
+                <<"START: "<<SIZE_RANGE_START<<" END: "<<SIZE_RANGE_END<<"\n";
     Timer timer;
     timer.start();
 
     char payload_buffer[256];
     uint64_t dropped_records = 0;
     
-    // RNG for dynamic load sizes
     std::mt19937 rng(999);
-    std::uniform_int_distribution<size_t> size_dist(20, 248); 
+    std::uniform_int_distribution<size_t> size_dist(SIZE_RANGE_START, SIZE_RANGE_END); 
 
     for (uint64_t i = 1; i <= config.num_records; i++) {
         std::string key = "user:" + std::to_string(i);
         size_t dynamic_size = size_dist(rng);
-        
+        global_record_sizes[i] = dynamic_size;
         generate_payload(i, false, payload_buffer, dynamic_size);
         
         bool success = db.put(key, payload_buffer, dynamic_size);
@@ -167,20 +190,16 @@ void load_database(StorageEngine& db, BenchConfig& config) {
 }
 
 // ============================================================================
-// 6. THE WORKER THREAD (DYNAMIC SIZES)
+// 6. THE WORKER THREAD 
 // ============================================================================
 void benchmark_worker(int thread_id, StorageEngine* db, BenchConfig config, ThreadMetrics* metrics) {
     FastZipfian zipf(config.num_records, config.zipf_theta, 42 + thread_id);
     std::mt19937 rng(1337 + thread_id);
     std::uniform_int_distribution<int> ratio_dist(1, 100);
-    
-    // Worker randomly resizes records on update!
-    std::uniform_int_distribution<size_t> size_dist(20, 248); 
+    std::uniform_int_distribution<size_t> size_dist(SIZE_RANGE_START, SIZE_RANGE_END); 
 
-    // Use resize() instead of reserve() and fill with 0.0. 
-    // This forces Linux to physically map the pages NOW, not during the benchmark.
-    // 50 million ops per thread handles up to 6.6M ops/sec total for 60s.
-    metrics->latencies.resize(50000000, 0.0);
+    // Uses the compile-time configuration to dynamically size RAM usage
+    metrics->latencies.resize(VECTOR_CAPACITY, 0.0);
 
     char update_payload[256];
     char read_buffer[256]; 
@@ -194,7 +213,10 @@ void benchmark_worker(int thread_id, StorageEngine* db, BenchConfig config, Thre
         int dice_roll = ratio_dist(rng);
         bool is_read = (dice_roll <= config.read_percent);
 
-        op_timer.start();
+        // Uses constexpr to eliminate the branch entirely if FULL_LATENCY_TRACKING is true
+        bool sample_latency = FULL_LATENCY_TRACKING || ((metrics->total_ops & SAMPLE_MASK) == 0);
+        if (sample_latency) op_timer.start();
+
         bool success = false;
         uint64_t out_size = 0;
 
@@ -204,21 +226,28 @@ void benchmark_worker(int thread_id, StorageEngine* db, BenchConfig config, Thre
                 metrics->corruptions++;
             }
         } else {
-            // Pick a completely new size to force Reallocations and SCM::free()
-            size_t new_dynamic_size = size_dist(rng);
-            generate_payload(key_id, true, update_payload, new_dynamic_size);
-            success = db->put(key, update_payload, new_dynamic_size);
+            size_t size = size_dist(rng);
+            // size_t size = global_record_sizes[key_id];
+            generate_payload(key_id, true, update_payload, size);
+            success = db->put(key, update_payload, size);
         }
-
-        double latency = op_timer.elapsed_us();
         
         if (global_bench_state.load(std::memory_order_relaxed) == BenchState::MEASURE) {
             metrics->total_ops++;
-            metrics->total_latency_us += latency;
             
-            // Raw array write: No branch prediction penalties, no VM page faults!
-            if (metrics->latency_count < 50000000) {
-                metrics->latencies[metrics->latency_count++] = latency;
+            if (sample_latency) {
+                double latency = op_timer.elapsed_ns() / 1000.0;
+                
+                // Adjust total latency sum based on sampling rate
+                if (FULL_LATENCY_TRACKING) {
+                    metrics->total_latency_us += latency;
+                } else {
+                    metrics->total_latency_us += (latency * SAMPLE_MULTIPLIER); 
+                }
+                
+                if (metrics->latency_count < VECTOR_CAPACITY) {
+                    metrics->latencies[metrics->latency_count++] = latency;
+                }
             }
             
             if (success) {
@@ -234,15 +263,12 @@ std::atomic<uint64_t> critical_samples{0};
 
 void telemetry_worker(StorageEngine* db) {
     while (global_bench_state.load(std::memory_order_relaxed) != BenchState::DONE) {
-        // Only record data during the MEASURE phase
         if (global_bench_state.load(std::memory_order_relaxed) == BenchState::MEASURE) {
             telemetry_samples.fetch_add(1, std::memory_order_relaxed);
-            
             if (db->is_arena_critical()) {
                 critical_samples.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        // Wake up every 1 millisecond to sample the system
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
@@ -255,11 +281,13 @@ int main(int argc, char* argv[]) {
 
     BenchConfig config;
     DBConfig db_config;
-    db_config.arena_size = 1024 * 1024 * 64; // Default 64MB
-    db_config.page_hot_scale = 1;            // Default scale
-    db_config.age_record_speed = 1;          // Default age speed
+    db_config.arena_size = 1024 * 1024 * 64; 
+    db_config.page_hot_scale = 2;            
+    db_config.age_record_speed = 1;          
+    db_config.enable_hot_rescue = true;
+    db_config.enable_monitor = true; 
+    db_config.backpressure_sleep_us = 0; 
 
-    // --- Simple CLI Parser ---
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--arena-mb" && i + 1 < argc) {
@@ -268,18 +296,36 @@ int main(int argc, char* argv[]) {
             db_config.page_hot_scale = std::stoi(argv[++i]);
         } else if (arg == "--age-speed" && i + 1 < argc) {
             db_config.age_record_speed = std::stoi(argv[++i]);
+        } else if (arg == "--backpressure-us" && i + 1 < argc) {
+            db_config.backpressure_sleep_us = std::stoull(argv[++i]);
+        }else if (arg == "--no-hot-rescue") {
+            db_config.enable_hot_rescue = false;
+        }else if (arg == "--partial-track"){
+            FULL_LATENCY_TRACKING = false;
+        }else if (arg == "--help") {
+            std::cout << "Usage: " << argv[0] << " [OPTIONS]\n"
+                      << "Options:\n"
+                      << "  --arena-mb <MB>         Set arena size in MB (default: 64)\n"
+                      << "  --hot-scale <SCALE>     Set page hot scale (default: 2)\n"
+                      << "  --age-speed <SPEED>     Set age record speed (default: 1)\n"
+                      << "  --backpressure-us <US>  Set backpressure sleep time in microseconds (default: 1)\n"
+                      << "  --no-hot-rescue         Disable hot rescue mechanism\n"
+                      << "  --partial-trakc         Track latency once every 256 operations\n"
+                      << "  --help                  Show this help message\n";
+            return 0;
         }
     }
 
     std::cout << "========================================================\n";
     std::cout << "   IMDB Benchmark (Dynamic Sizes - YCSB Workload B)     \n";
     std::cout << "   Config: " << (db_config.arena_size / 1024 / 1024) << "MB Arena | "
-              << "Scale: " << db_config.page_hot_scale << " | "
-              << "AgeSpeed: " << db_config.age_record_speed << "\n";
+              << "Scale: " << (unsigned int)db_config.page_hot_scale << " | "
+              << "AgeSpeed: " << (unsigned int)db_config.age_record_speed << " | "
+              << "Backpressure: " << db_config.backpressure_sleep_us << "us\n";
+    std::cout << "   Latency Mode: " << (FULL_LATENCY_TRACKING ? "100% Tracking (~3GB RAM)" : "Sampled") << "\n";
     std::cout << "========================================================\n";
 
     StorageEngine db(db_config);
-
     load_database(db, config);
 
     std::vector<std::thread> workers;
@@ -318,13 +364,10 @@ int main(int argc, char* argv[]) {
         total_latency_sum += metrics[i].total_latency_us;
     }
 
-    // --- LATENCY PERCENTILE CALCULATION ---
-    std::cout << "\n[Phase 5] Sorting " << total_ops << " latency records... (This may take a moment)\n";
+    std::cout << "\n[Phase 5] Sorting latency samples...\n";
     std::vector<double> all_latencies;
-    all_latencies.reserve(total_ops);
     
     for (int i = 0; i < config.num_threads; i++) {
-        // Only insert the actual recorded count
         all_latencies.insert(all_latencies.end(), 
                              metrics[i].latencies.begin(), 
                              metrics[i].latencies.begin() + metrics[i].latency_count);
@@ -334,27 +377,37 @@ int main(int argc, char* argv[]) {
 
     double p50 = 0, p90 = 0, p99 = 0, p999 = 0, p100 = 0;
     if (!all_latencies.empty()) {
-        p50 = all_latencies[total_ops * 0.50];
-        p90 = all_latencies[total_ops * 0.90];
-        p99 = all_latencies[total_ops * 0.99];
-        p999 = all_latencies[total_ops * 0.999];
+        size_t sample_count = all_latencies.size();
+        p50 = all_latencies[sample_count * 0.50];
+        p90 = all_latencies[sample_count * 0.90];
+        p99 = all_latencies[sample_count * 0.99];
+        p999 = all_latencies[sample_count * 0.999];
         p100 = all_latencies.back();
     }
-    // --------------------------------------
 
     std::cout << "\n[Phase 6] Running validation sweep...\n";
     uint64_t validation_success = 0;
     char val_buf[256];
     uint64_t val_size;
     
-    for (uint64_t i = 1; i <= 10000; i++) {
+    // Check 5000 HOT records (Mostly in RAM)
+    for (uint64_t i = 1; i <= 5000; i++) {
         std::string key = "user:" + std::to_string(i);
         if (db.get(key, val_buf, val_size)) {
             if (verify_payload(i, val_buf, val_size)) validation_success++;
         }
     }
     
-    std::cout << "Validation: " << validation_success << " / 10000 initial records securely verified.\n";
+    // Check 5000 COLD records (Definitely on disk)
+    for (uint64_t i = 0; i < 5000; i++) {
+        uint64_t cold_key = 900000 + i; 
+        std::string key = "user:" + std::to_string(cold_key);
+        if (db.get(key, val_buf, val_size)) {
+            if (verify_payload(cold_key, val_buf, val_size)) validation_success++;
+        }
+    }
+    
+    std::cout << "Validation: " << validation_success << " / 10000 records securely verified.\n";
     if (validation_success == 10000 && total_corruptions == 0) std::cout << "Status: PASS (No data corruption detected!)\n\n";
     else std::cout << "\033[31mStatus: FAIL (Data corruption or lost records detected!)\033[0m\n\n";
 
@@ -386,13 +439,11 @@ int main(int argc, char* argv[]) {
               << critical_percent << "% of the time (" 
               << critical_samples << " / " << telemetry_samples << " ms)\n";
 
-    // --- EVICTION STATS ANALYSIS ---
     uint64_t hot_rescued = db.hot_rescued_count.load();
     uint64_t whole_evicted = db.whole_page_evicted_count.load();
     uint64_t partial_evicted = db.partial_page_evicted_count.load();
     uint64_t total_scanned = db.check_page_count.load();
 
-    // The arena capacity in pages (based on your 64MB / 4KB config)
     const uint64_t arena_pages = db_config.arena_size / 4096; 
     
     double iterations = (double)total_scanned / arena_pages;
@@ -410,6 +461,11 @@ int main(int argc, char* argv[]) {
     std::cout << "Eviction Success Rate:      " << candidate_pct << "% (Evicted/Scanned)\n";
     std::cout << "Whole/Partial Ratio:        " << eviction_ratio << ":1\n";
     std::cout << "=========================================================\n";
+
+    double cache_hit_rate = (db.ram_hit_count.load() + db.ram_miss_count.load() > 0) ? 
+                        (double)db.ram_hit_count.load() / (db.ram_hit_count.load() + db.ram_miss_count.load()) * 100.0 : 0.0;
+
+    std::cout << "cache hit rate: " << std::fixed << std::setprecision(2) << cache_hit_rate << "%\n";
 
     return 0;
 }

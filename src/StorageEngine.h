@@ -13,8 +13,6 @@
 
 namespace imdb{
 #define TABLE_END  0XFFFFFFFFFFFFFFFF
-
-// TODO: will the FIFO feature of TT makes this inefficient?
 #define TT_SHARDS 1024
 
 /* strcut RecordLoc(record location). Content in the translation table. 
@@ -42,8 +40,7 @@ struct RecordLoc{
     };
 }; 
 
-/* record header. logical id must be stored here to complete reverse map in evcition.
- * TODO: might consider putting 'record size' here, too! For DB persistence
+/* Logical id is stored in record header for reverse map in evcition.
  */
 #pragma pack(push, 1)
 struct RecordHeader{
@@ -55,19 +52,19 @@ struct RecordHeader{
 };
 #pragma pack(pop)
 
-/* config object*/
-struct DBConfig{
-    std::string db_file_path = "./data/imdb.aof";
-    // uint8_t table_grow_speed = 2;
-    size_t arena_size = 1024 * 1024 * 512; // default 512MB
-    bool enable_hot_rescue = 1;
+/* config object, aligned to cache line to prevent false sharing */
+struct alignas(64) DBConfig{
+    size_t backpressure_sleep_us = 1; // 0 to disable backpressure
     uint8_t age_record_speed = 1;
     uint8_t page_hot_scale = 1;
+    bool enable_hot_rescue = 1;
+    bool enable_monitor = false;
+    // uint8_t table_grow_speed = 2;
+    size_t arena_size = 1024 * 1024 * 512; // default 512MB
+    std::string db_file_path = "./data/imdb.aof";
 };
 
-/* StorageEngine, the highest level interface, provides put, get and delete. 
- * TODO: it owns sweeper thread. Might wish to move it else where.
- */
+/* Provides put, get, del. Also implements the eviction logic */
 class StorageEngine{
     private:
         DBConfig config;
@@ -85,16 +82,12 @@ class StorageEngine{
         /* translation table, bridge hashmap and record location. See comment at struct RecordLoc */
         std::vector<RecordLoc> translation_table;
         /* locks that protects TT's content. */
-        // TODO: proformance degrade as tt grows large?
         std::shared_mutex tt_locks[TT_SHARDS];
         /* lock that protects the internal free list in TT. Only used in entry allocation/free */
         std::shared_mutex tt_meta_rw_lock;
        
         /* tracks key -> translation_table index mappings */
         ShardedHashMap hashmap;
-
-        uint8_t page_hot_scale;
-        uint8_t age_record_speed;
 
         void evict_cold_page();
         /* rescue hot record, and write other records to disk.*/
@@ -129,6 +122,8 @@ class StorageEngine{
         std::atomic<uint64_t> check_page_count{0};
         std::atomic<uint64_t> whole_page_evicted_count{0};
         std::atomic<uint64_t> partial_page_evicted_count{0};
+        std::atomic<uint64_t> ram_hit_count{0};
+        std::atomic<uint64_t> ram_miss_count{0};
         bool is_arena_critical() const { return arena.is_critical(); }
 
         StorageEngine(const DBConfig &cfg = DBConfig());

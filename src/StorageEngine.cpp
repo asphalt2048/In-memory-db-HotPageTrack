@@ -9,13 +9,11 @@
 namespace imdb{
 StorageEngine::StorageEngine(const DBConfig &cfg):
     config(cfg),
-    arena(cfg.arena_size),
+    arena(cfg.arena_size, config.backpressure_sleep_us),
     disk_manager(config.db_file_path),
     SCMs{{16, arena}, {32, arena}, {64, arena}, {128, arena}, {256, arena}},
     sweeper(arena, [this](){this->evict_cold_page();}),
-    next_logical_id(0),
-    page_hot_scale(cfg.page_hot_scale),
-    age_record_speed(cfg.age_record_speed)
+    next_logical_id(0)
 {
     translation_table.resize(TABLE_SIZE);
     for(int i = 0; i<TABLE_SIZE-1; i++){ translation_table[i].next_free_idx = i + 1; }
@@ -51,8 +49,7 @@ void StorageEngine::remove_from_table(uint64_t logical_id){
     next_logical_id = logical_id;
 }
 
-// TODO: .resize() is actually copy&paste, which means
-// a concurrent access to TT might read on the old location
+// .resize() is actually copy&paste, which requires a TT global lock to perform.
 /*
 void StorageEngine::grow_table(){
     uint64_t old_size = translation_table.size();
@@ -68,7 +65,7 @@ void StorageEngine::grow_table(){
 }
 */
 
-/*------------------------------------Helper Functions---------------------------------------*/
+/*------------------------------------------------Helper Functions------------------------------------------------------*/
 
 uint8_t StorageEngine::get_scm_index(uint64_t total_size) {
     if (total_size <= 16) return 0;
@@ -98,12 +95,13 @@ bool StorageEngine::hashmap_recheck(const std::string &key, uint64_t expected_id
     return true;
 }
 
+/*------------------------------------------------------DB interface-----------------------------------------------------*/
+
+/* WARNING: DB interface must pre alloc space before holding TT's lock. Otherwise there will be deadlock when OOM happens. */
+
 bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, const char* record, uint64_t record_size){
     size_t real_size = record_size + sizeof(RecordHeader);
 
-    /* DB interface must pre alloc space before holding TT's lock.
-     * Otherwise there will be deadlock when OOM happens.
-     */
     SizeClassManager &scm = SCMs[get_scm_index(real_size)];
     void* pre_alloc_slot = scm.alloc();
 
@@ -119,6 +117,10 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
 
     /* case 1: record is in ram */
     if(loc.in_use.is_in_ram){
+        if(config.enable_monitor){
+            ram_hit_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        
         void* old_slot_addr = loc.in_use.ram_addr;
         size_t old_size = get_struct_page(old_slot_addr)->header.slot_size;
         SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
@@ -149,6 +151,10 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
     }
     /* case 2: record is in disk */
     else{
+        if(config.enable_monitor){
+            ram_miss_count.fetch_add(1, std::memory_order_relaxed); 
+        }
+
         fill_slot_nocheck(pre_alloc_slot, logical_id, record, record_size);
         promote_a_slot(pre_alloc_slot);
 
@@ -193,15 +199,7 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
     return true;
 }
 
-/*-----------------------------------------Interface---------------------------------------------*/
-
 bool StorageEngine::put(const std::string& key, const char* record, uint64_t record_size){
-    // Direct relcaim
-    // TODO: I really want to remove this line. 
-    while(arena.is_critical()){
-        std::this_thread::yield(); // yield to sweeper
-    }
-
     size_t real_size = record_size + sizeof(RecordHeader);
     if(real_size > 256){
         std::cerr<<RED<<"Out of bound\n"<<RESET;
@@ -263,6 +261,9 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
         out_record_size = loc.in_use.size;
         promote_a_slot(loc.in_use.ram_addr);
 
+        if(config.enable_monitor){
+            ram_hit_count.fetch_add(1, std::memory_order_relaxed);
+        }
         return true;
     }
 
@@ -282,7 +283,7 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
 
     if(!hashmap_recheck(key, logical_id)){ scm.free(pre_alloc_slot); return false; }
     
-    if(loc.in_use.is_in_ram){ 
+    if(loc.in_use.is_in_ram){
         // Someone beat us to it! Just read from RAM and give our unused slot back.
         // Could be a concurrent get or update
         scm.free(pre_alloc_slot); 
@@ -291,7 +292,10 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
         std::memcpy(buf, header->get_payload(), loc.in_use.size);
         out_record_size = loc.in_use.size;
         promote_a_slot(loc.in_use.ram_addr);
-        
+
+        if(config.enable_monitor){
+            ram_hit_count.fetch_add(1, std::memory_order_relaxed);
+        }
         return true; 
     } 
 
@@ -317,6 +321,9 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
     loc.in_use.is_in_ram = true;
     loc.in_use.ram_addr = pre_alloc_slot;
 
+    if(config.enable_monitor){
+        ram_miss_count.fetch_add(1, std::memory_order_relaxed);
+    }
     return true;
 }
 
@@ -343,9 +350,16 @@ bool StorageEngine::del(const std::string& key){
 
         mark_slot_cold(slot_addr);
         SCMs[get_scm_index(slot_size)].free(slot_addr);
+
+        if(config.enable_monitor){
+            ram_hit_count.fetch_add(1, std::memory_order_relaxed);
+        }
     } 
     /* record is in disk, logical delete */
     else{
+        if(config.enable_monitor){
+            ram_miss_count.fetch_add(1, std::memory_order_relaxed);
+        }
         // Logical deletion for on-disk records. We just delete metadata.
         // that way from the user's view, the record is deleted as well.
     }
@@ -356,9 +370,7 @@ bool StorageEngine::del(const std::string& key){
     return true;
 }
 
-/* ============================================================================================= */
-/*-----------------------------------------Eviction logic----------------------------------------*/
-/* ============================================================================================= */
+/*----------------------------------------------------Eviction logic--------------------------------------------------*/
 
 void StorageEngine::page_hot_rescue(Page* victim_page){
     SizeClassManager &scm = SCMs[get_scm_index(victim_page->header.slot_size)];
@@ -415,7 +427,7 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
                 size_t total_size = loc.in_use.size + sizeof(RecordHeader);
                 uint8_t hotness = get_slot_hotness(slot_addr);
                 // --- BEST EFFORT RESCUE ---
-                if (config.enable_hot_rescue && hotness >= 3 - age_record_speed){
+                if (config.enable_hot_rescue && hotness >= 3 - config.age_record_speed){
                     /* TRY to ask free space in SCM. Might fail. 
                      * If fail, let the record die(write to disk).
                      *
@@ -431,11 +443,13 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
                         clear_allocated_bit(victim_page, slot_idx);
                         mark_slot_cold(slot_addr);
                         victim_page->header.used.fetch_sub(1);
-                        // debug
-                        hot_rescued_count.fetch_add(1, std::memory_order_relaxed);
+
+                        if(config.enable_monitor){
+                            hot_rescued_count.fetch_add(1, std::memory_order_relaxed);
+                        }
+
                         continue;
                     }
-                    // TODO: do we lift the 'new home' in lru?
                 }
 
                 // --- COLD EVICTION (OR RESCUE FAILED) ---
@@ -459,10 +473,11 @@ void StorageEngine::evict_cold_page() {
     while (true) {
         Page* victim_page = reinterpret_cast<Page*>(arena.get_lru_tail());
         if (!victim_page) return; 
-        //debug
-        check_page_count.fetch_add(1, std::memory_order_relaxed);
+        if(config.enable_monitor){
+            check_page_count.fetch_add(1, std::memory_order_relaxed);
+        }
 
-        /* There is a TOCTOU bug, that the victim page become empty and returned to arena before 
+        /* TODO: There is a TOCTOU bug, that the victim page become empty and returned to arena before 
          * sweeper is able to evict it. 
          * The page might has been allocated to another SCM before we are able to quarantine it.
          * The current fix is doing a double check inside scm.quarantine_page(), which is not elegant
@@ -485,15 +500,12 @@ void StorageEngine::evict_cold_page() {
          * the page is lifted to the head of lru. And all hot bits are cleared
           ======================================================================= */
 
-        if(true){ //debug
-            uint16_t hot_count = age_and_get_page_hot_count(victim_page, age_record_speed);
-            if (hot_count > (max_slots * page_hot_scale)){
-                scm.unquarantine_page(victim_page);
-                continue; 
-            }
+        uint16_t hot_count = age_and_get_page_hot_count(victim_page, config.age_record_speed);
+        if (hot_count > (max_slots * config.page_hot_scale)){
+            scm.unquarantine_page(victim_page);
+            continue; 
         }
-        /* page selected as evcition target */
-        page_hot_rescue(victim_page);
+        page_hot_rescue(victim_page); // page selected as evcition target
 
         /* decide whether the victim page should be linked back to partial list, or return to arena 
          * (1) If page is not fully cleared, e.g. try_lock failed, or meet a partial in use page that eventually in-use
@@ -501,20 +513,25 @@ void StorageEngine::evict_cold_page() {
          * (2) If the page is fully cleared, return it to arena
          */
         Status status = scm.unquarantine_page(victim_page);
-        switch (status)
-        {
-        case FULL_PAGE_EVICTED:
-            whole_page_evicted_count.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case PARTIAL_PAGE_EVICTED:
-            partial_page_evicted_count.fetch_add(1, std::memory_order_relaxed);
-            break;
-        default:
-            std::cerr<<RED<<"FATAL: unquarantine page meets undefined status\n"<<RESET;
+        if(status == ERROR){
+            std::cerr<<RED<<"Sweeper error: unquarantine page met undefined status\n"<<RESET;
             exit(-1);
-            break;
         }
 
+        if(config.enable_monitor){
+            switch (status)
+            {
+            case FULL_PAGE_EVICTED:
+                whole_page_evicted_count.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case PARTIAL_PAGE_EVICTED:
+                partial_page_evicted_count.fetch_add(1, std::memory_order_relaxed);
+                break;
+            default:
+                break;
+            }
+        }
+        
         if(arena.is_safe()){
             break;
         }

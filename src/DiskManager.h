@@ -23,10 +23,8 @@ public:
     DiskManager(const std::string& db_file_path);
     ~DiskManager();
 
-    /* Appends a record to the end of the disk file. Returns the byte offset.
-     * TODO: 
-     *  currently, buffering work for OS, which buffers writes until block size is hit. 
-     *  If ever what to optimize the syscall to pwrite, a user-space buffer should be added.  
+    /* Appends a record to the end of the disk file. Returns the byte offset. 
+     * TODO: If ever what to reduce syscalls to pwrite, a user-space buffer should be added.  
      */
     size_t write_record(const char* data, size_t size);
 

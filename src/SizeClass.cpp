@@ -33,8 +33,10 @@ void SizeClassManager::remove_from_partial_list(Page *page){
     page->header.next = nullptr;
 }
 
+
+// TODO: heavy load on a single SC will cause it to ask many pages at once, which might not be prefered.
+
 Page* SizeClassManager::get_a_page(){
-    /* TODO: massive insert will cause multiple thread hitting this simultaneously */
     void* raw_addr = arena.alloc_a_page();
     /* This should never be nullptr, alloc_a_page must be successful */
     if(raw_addr == nullptr){
@@ -131,7 +133,6 @@ void* SizeClassManager::alloc(){
     write_lock.unlock(); 
     // get page might sleep, drop the lock in case sweeper need it
     Page* new_page = get_a_page();
-    // TODO: heavy load on a single SC will cause it to ask many pages at once.
     write_lock.lock();
 
     uint16_t slot_idx = get_free_slot(new_page);
@@ -251,9 +252,6 @@ Status SizeClassManager::unquarantine_page(Page* page){
 /*-------------------------Helper functions---------------------------------------*/
 /* They are not bind to a size class(not a member funtion) for flexibilty reasons */
 
-// TODO: lock free or not? Does user need to hold lock when calling this function?
-// (this is a write to page, a write need a lock)
-// false positive acceptable?
 void promote_a_slot(void* slot_addr, uint8_t inc){
     Page* page = get_struct_page(slot_addr);
     uint16_t slot_id = page->get_slot_idx_nocheck(slot_addr);

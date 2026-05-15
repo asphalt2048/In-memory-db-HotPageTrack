@@ -17,6 +17,7 @@
 #define RED     "\033[31m"  /* text color: red */
 #define RESET   "\033[0m"   /* reset color */ 
 #define PAGE_ALIGN(x) ((x) & ~(4096ULL - 1))
+// record header is 8 bytes, so SC begins with 16 bytes. A page have at most 256 records. Each have 2 is_hot bits.
 #define IS_HOT_ARR_LENGTH 8
 #define IS_ALLOCATED_ARR_LENGHT 4
 
@@ -39,7 +40,6 @@ struct Page{
             Page* lru_prev{nullptr};
             Page* lru_next{nullptr};
         };
-        // uint32_t page_id; //TODO: delete this?
 
         uint16_t slot_size;
         uint16_t max_slots; // dynamically set by SizeClassManager::init_page()
@@ -50,11 +50,8 @@ struct Page{
         uint16_t header_reserved;
     }header;
 
-    /* array that tracks records usage. use two bits to measures a record's hotness. 
-     * TODO: Record header is 8 bytes, so SC begins with 16 bytes. Making a page containing at most 254 records.
-     */
+    /* array that tracks records usage. use two bits to measures a record's hotness. */
     std::atomic<uint64_t> is_hot[IS_HOT_ARR_LENGTH];
-    /* TODO: added this just to prevent a deadlock bug. See StorageEngine.cpp: page_hot_rescue. Free slot bug */
     std::atomic<uint64_t> is_allocated[IS_ALLOCATED_ARR_LENGHT];
 
     /* ------------------Helper functions--------------------- */
@@ -72,45 +69,42 @@ class Arena{
     private:
         static constexpr size_t PAGE_SIZE = 4096;
 
-        /* --- DYNAMIC SIZING --- */
         size_t arena_size;
         size_t total_pages;
         size_t bitmap_size;
 
-        /* Dynamically allocated array of atomics */
         std::unique_ptr<std::atomic<uint64_t>[]> bitmap;
 
         /* The beginning address of arena */
         void *arena_base;
         std::atomic<size_t> used_pages{0};
         
-        /* record the idx where we found last free page
-         * next search won't start from idx 0, beneficial for continuous alloc 
-         */
+        /* record the idx where we found last free page */
         std::atomic<size_t> last_searched_idx;
 
         size_t high_watermark;
         size_t min_watermark;
         size_t low_watermark;
 
+        size_t backpressure_sleep_us;
+
         std::mutex lru_mutex;
         Page* lru_head{nullptr};
         Page* lru_tail{nullptr};
         
     public:
-        Arena(size_t size_in_bytes);
+        Arena(size_t size_in_bytes, size_t backpressure_sleep_us = 1);
         ~Arena();
 
         std::mutex sweeper_mutex;
         std::atomic<bool> is_sweeper_running{false};
         std::condition_variable sweeper_cv;
 
-        /* Allocate one page from arena, returns page-aligned address. 
-         * Will checks for watermarks, might sleep */
+        /* Allocate one page from arena, returns page-aligned address. WARNING: might sleep */
         void* alloc_a_page();
         /* simply set the bitmap to mark page free */
         void free_a_page(void *raw_page_base);
-        /* don't check matermarks, never sleep. Might return nullptr. */
+        /* Same as alloc_a_page but never sleep. Might return nullptr. */
         void* alloc_a_page_nocheck();
 
         void add_to_lru(void* page_base);

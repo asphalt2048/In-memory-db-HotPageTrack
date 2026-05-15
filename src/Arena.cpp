@@ -1,10 +1,11 @@
 #include "Arena.h"
 
 namespace imdb{
-Arena::Arena(size_t size_in_bytes) : 
+Arena::Arena(size_t size_in_bytes, size_t backpressure_sleep_us): 
     arena_size(size_in_bytes),
     total_pages(size_in_bytes / PAGE_SIZE),
-    bitmap_size(total_pages / 64)
+    bitmap_size(total_pages / 64),
+    backpressure_sleep_us(backpressure_sleep_us)
 {
     // Runtime check replacing the old static_assert
     if (total_pages % 64 != 0) {
@@ -70,10 +71,14 @@ void* Arena::alloc_a_page(){
         std::this_thread::yield();
     }
 
-    // backpressure
+    /* Don't hold any mutex here. 
+     * Might suffer a lost wakeup(needs_sweeping is true, but no sweeper awaken),
+     * but following alloc_a_page will wake up one eventually.
+     */
     if (needs_sweeping()){
         sweeper_cv.notify_one();
-        std::this_thread::sleep_for(std::chrono::microseconds(1)); 
+        // backpressure
+        std::this_thread::sleep_for(std::chrono::microseconds(backpressure_sleep_us)); 
     }
     
     /* allocation should be OK with direct reclamation ahead */
@@ -81,13 +86,6 @@ void* Arena::alloc_a_page(){
     if(page == nullptr){
         std::cerr<<RED<<"OOM: Page alloc failed\n"<<RESET;
         exit(-1);
-    }
-    /* Don't hold any mutex here. 
-     * Might suffer a lost wakeup(needs_sweeping is true, but no sweeper awaken),
-     * but following alloc_a_page will wake up one eventually.
-     */
-    if(needs_sweeping()){
-        sweeper_cv.notify_one();
     }
 
     return page;

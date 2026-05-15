@@ -44,7 +44,7 @@ void EvictionSweeper::evict_loop(){
             break; 
         }
 
-        // We hit the Low Watermark. Evict pages until we drop back down to the High Watermark.
+        // Evict pages until we drop back down to the High Watermark.
         while (!arena.is_safe() && !shutdown_flag.load()) {
             
             // Execute the callback! 
@@ -55,9 +55,6 @@ void EvictionSweeper::evict_loop(){
                 break;
             }
         }
-        
-        // Loop finishes, cv_lock is automatically destroyed/unlocked, 
-        // and we loop back up to Step A to go back to sleep.
     }
 }
 
