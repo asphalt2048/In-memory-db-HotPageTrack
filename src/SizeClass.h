@@ -76,20 +76,20 @@ class SizeClassManager{
         Status unquarantine_page(Page* page);
 };
 
-/* helper function. Used for is_hot array */
-// increase is_hot to make a slot have lower chance to be swapped out
+/* helper function. Used for hotness array */
+// increase hotness to make a slot have lower chance to be swapped out
 void promote_a_slot(void* slot_addr, uint8_t inc = 1);
-// decrease is_hot to make a slot have higher chance to be swapped out
+// decrease hotness to make a slot have higher chance to be swapped out
 void age_a_slot(void* slot_addr);
-// mark is_hot as zero. 
+// mark hotness as zero. 
 void mark_slot_cold(void* slot_addr);
 uint8_t get_slot_hotness(void* slot_addr);
 void set_slot_hotness(void* slot_addr, uint8_t exact_val);
-// return the total is_hot count
+// return the total hotness count
 uint16_t get_page_hot_count(Page* page);
-// also do '-1' on is_hot
+// also do '-1' on hotness
 uint16_t age_and_get_page_hot_count(Page* page, uint8_t age_speed);
-// clear is_hot
+// clear hotness
 void clear_page_hot_bits(Page* page);
 
 /* helper function. Input: addr of a slot. Output: struct page the slot belonging to */

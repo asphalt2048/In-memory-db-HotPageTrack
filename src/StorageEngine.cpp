@@ -117,13 +117,19 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
 
     /* case 1: record is in ram */
     if(loc.in_use.is_in_ram){
-        if(config.enable_monitor){
-            ram_hit_count.fetch_add(1, std::memory_order_relaxed);
-        }
-        
         void* old_slot_addr = loc.in_use.ram_addr;
         size_t old_size = get_struct_page(old_slot_addr)->header.slot_size;
         SizeClassManager &old_scm = SCMs[get_scm_index(old_size)];
+
+        // For benchmark ================================================
+        if(config.enable_monitor){
+            ram_hit_count.fetch_add(1, std::memory_order_relaxed);
+            total_data_size_in_ram.fetch_sub(loc.in_use.size, std::memory_order_relaxed);
+            total_data_size_in_ram.fetch_add(record_size, std::memory_order_relaxed);
+        }
+        // ==============================================================
+        
+        
 
         /* case 1.1: New data fits in the existing slot. Update in-place. */
         if(scm.get_slot_size() == old_scm.get_slot_size()){
@@ -151,9 +157,12 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
     }
     /* case 2: record is in disk */
     else{
+        // for benchmark =====================================================
         if(config.enable_monitor){
-            ram_miss_count.fetch_add(1, std::memory_order_relaxed); 
+            ram_miss_count.fetch_add(1, std::memory_order_relaxed);
+            total_data_size_in_ram.fetch_add(record_size, std::memory_order_relaxed);
         }
+        // ===================================================================
 
         fill_slot_nocheck(pre_alloc_slot, logical_id, record, record_size);
         promote_a_slot(pre_alloc_slot);
@@ -166,7 +175,7 @@ bool StorageEngine::update_record(const std::string &key, uint64_t logical_id, c
 }
 
 
-bool StorageEngine::insert_record(const std::string& key, const char* record, uint64_t record_size, uint64_t &collided_id) {
+bool StorageEngine::insert_record(const std::string& key, const char* record, uint64_t record_size, uint64_t &collided_id){
     SizeClassManager &scm = SCMs[get_scm_index(record_size + sizeof(RecordHeader))];
     void* new_slot_addr = scm.alloc();
 
@@ -176,7 +185,8 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
     uint64_t new_logical_id = add_to_table(new_loc);
     fill_slot_nocheck(new_slot_addr, new_logical_id, record, record_size);
     
-    
+    // WARNING: only update TT after hashmap.insert is successful
+    // WARNING: need to ensure no one can read from an un-updated TT after hashmap.insert is successful
     size_t lock_idx = new_logical_id % TT_SHARDS;
     std::unique_lock<std::shared_mutex> write_lock(tt_locks[lock_idx]);
 
@@ -195,6 +205,12 @@ bool StorageEngine::insert_record(const std::string& key, const char* record, ui
     translation_table[new_logical_id].in_use.is_in_ram = true;
     translation_table[new_logical_id].in_use.size = record_size;
     translation_table[new_logical_id].in_use.ram_addr = new_slot_addr;
+
+    // for benchmark =============================================
+    if(config.enable_monitor){
+        total_data_size_in_ram.fetch_add(record_size, std::memory_order_relaxed);
+    }
+    // ===========================================================
 
     return true;
 }
@@ -244,7 +260,7 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
 
     size_t lock_idx = logical_id % TT_SHARDS;
     
-    // 1. FAST PATH: Start with a READ lock
+    // 1. FAST PATH: assume record is in ram, start with a READ lock
     std::shared_lock<std::shared_mutex> read_lock(tt_locks[lock_idx]);
 
     if(!hashmap_recheck(key, logical_id)){
@@ -261,9 +277,12 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
         out_record_size = loc.in_use.size;
         promote_a_slot(loc.in_use.ram_addr);
 
+        // for benchmark =============================================
         if(config.enable_monitor){
             ram_hit_count.fetch_add(1, std::memory_order_relaxed);
         }
+        // ===========================================================
+
         return true;
     }
 
@@ -284,8 +303,7 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
     if(!hashmap_recheck(key, logical_id)){ scm.free(pre_alloc_slot); return false; }
     
     if(loc.in_use.is_in_ram){
-        // Someone beat us to it! Just read from RAM and give our unused slot back.
-        // Could be a concurrent get or update
+        // Some concurrent get or update beat this thread.
         scm.free(pre_alloc_slot); 
 
         RecordHeader* header = reinterpret_cast<RecordHeader*>(loc.in_use.ram_addr);
@@ -321,9 +339,13 @@ bool StorageEngine::get(const std::string& key, char* buf, uint64_t& out_record_
     loc.in_use.is_in_ram = true;
     loc.in_use.ram_addr = pre_alloc_slot;
 
+    // for benchmark ===============================================
     if(config.enable_monitor){
         ram_miss_count.fetch_add(1, std::memory_order_relaxed);
+        total_data_size_in_ram.fetch_add(record_size, std::memory_order_relaxed);
     }
+    // =============================================================
+
     return true;
 }
 
@@ -351,17 +373,22 @@ bool StorageEngine::del(const std::string& key){
         mark_slot_cold(slot_addr);
         SCMs[get_scm_index(slot_size)].free(slot_addr);
 
+        // for benchmark =============================================
         if(config.enable_monitor){
             ram_hit_count.fetch_add(1, std::memory_order_relaxed);
+            total_data_size_in_ram.fetch_sub(loc.in_use.size, std::memory_order_relaxed);
         }
+        // ===========================================================
     } 
     /* record is in disk, logical delete */
     else{
+        // for benchmark =============================================
         if(config.enable_monitor){
             ram_miss_count.fetch_add(1, std::memory_order_relaxed);
         }
+        // ===========================================================
+
         // Logical deletion for on-disk records. We just delete metadata.
-        // that way from the user's view, the record is deleted as well.
     }
 
     remove_from_table(logical_id);
@@ -426,7 +453,7 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
 
                 size_t total_size = loc.in_use.size + sizeof(RecordHeader);
                 uint8_t hotness = get_slot_hotness(slot_addr);
-                // --- BEST EFFORT RESCUE ---
+                // --- BEST EFFORT HOT RESCUE ---
                 if (config.enable_hot_rescue && hotness >= 3 - config.age_record_speed){
                     /* TRY to ask free space in SCM. Might fail. 
                      * If fail, let the record die(write to disk).
@@ -444,9 +471,11 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
                         mark_slot_cold(slot_addr);
                         victim_page->header.used.fetch_sub(1);
 
+                        // for benchmark =============================================
                         if(config.enable_monitor){
                             hot_rescued_count.fetch_add(1, std::memory_order_relaxed);
                         }
+                        // ===========================================================
 
                         continue;
                     }
@@ -460,6 +489,13 @@ void StorageEngine::page_hot_rescue(Page* victim_page){
                 clear_allocated_bit(victim_page, slot_idx);
                 mark_slot_cold(slot_addr);
                 victim_page->header.used.fetch_sub(1);
+
+                // for benchmark =============================================
+                if(config.enable_monitor){
+                    total_data_size_in_ram.fetch_sub(total_size - sizeof(RecordHeader), std::memory_order_relaxed);
+                }
+                // ===========================================================
+
             }else{
                 continue; // slot is partial in-use, let it go.
             }

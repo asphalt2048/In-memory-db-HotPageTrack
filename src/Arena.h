@@ -17,7 +17,7 @@
 #define RED     "\033[31m"  /* text color: red */
 #define RESET   "\033[0m"   /* reset color */ 
 #define PAGE_ALIGN(x) ((x) & ~(4096ULL - 1))
-// record header is 8 bytes, so SC begins with 16 bytes. A page have at most 256 records. Each have 2 is_hot bits.
+// record header is 8 bytes, so SC begins with 16 bytes. A page have at most 256 records. Each have 2 hotness bits.
 #define IS_HOT_ARR_LENGTH 8
 #define IS_ALLOCATED_ARR_LENGHT 4
 
@@ -51,7 +51,7 @@ struct Page{
     }header;
 
     /* array that tracks records usage. use two bits to measures a record's hotness. */
-    std::atomic<uint64_t> is_hot[IS_HOT_ARR_LENGTH];
+    std::atomic<uint64_t> hotness[IS_HOT_ARR_LENGTH];
     std::atomic<uint64_t> is_allocated[IS_ALLOCATED_ARR_LENGHT];
 
     /* ------------------Helper functions--------------------- */
@@ -118,6 +118,10 @@ class Arena{
         bool is_safe() const { return used_pages.load() <= high_watermark; }
 
         /* translate a raw address to page id */
+        // TODO: no longer useful, remove this.
         uint32_t get_page_id(void* raw_addr);
+
+        // benchmark:
+        size_t get_used_page(){return used_pages.load(std::memory_order_relaxed);}
 };
 }// namespace imdb

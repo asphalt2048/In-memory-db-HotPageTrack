@@ -72,9 +72,9 @@ Page* SizeClassManager::init_page(void* raw_page_base){
     page->header.header_reserved = header_slots * slot_size;
     page->header.max_slots = (Page::PAGE_SIZE - page->header.header_reserved) / slot_size;
 
-    /* setup is_hot array */
+    /* setup hotness array */
     for(int i=0; i < IS_HOT_ARR_LENGTH; i++){
-        page->is_hot[i].store(0ULL, std::memory_order_relaxed);
+        page->hotness[i].store(0ULL, std::memory_order_relaxed);
     }
     /* setup is_allocated array */
     for(int i=0; i < IS_ALLOCATED_ARR_LENGHT; i++){
@@ -260,8 +260,8 @@ void promote_a_slot(void* slot_addr, uint8_t inc){
     size_t bit_idx = slot_id % 32;
     size_t bit_shift = bit_idx*2;
 
-    // use CAS loop to update is_hot
-    uint64_t old_arr = page->is_hot[arr_idx].load(std::memory_order_relaxed);
+    // use CAS loop to update hotness
+    uint64_t old_arr = page->hotness[arr_idx].load(std::memory_order_relaxed);
     while(true){
         uint64_t current_val = (old_arr>>bit_shift) & 0b11ULL;
         // already reached the max hotness, do nothing
@@ -271,7 +271,7 @@ void promote_a_slot(void* slot_addr, uint8_t inc){
         if(new_val > 3) new_val = 3;
 
         uint64_t new_arr = (old_arr & ~(0b11ULL<<bit_shift)) | (new_val << bit_shift);
-        if(page->is_hot[arr_idx].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){
+        if(page->hotness[arr_idx].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){
             break;
         }
     }
@@ -286,8 +286,8 @@ void age_a_slot(void* slot_addr){
     size_t bit_idx = slot_id % 32;
     size_t bit_shift = bit_idx*2;
 
-    // use CAS loop to update is_hot
-    uint64_t old_arr = page->is_hot[arr_idx].load(std::memory_order_relaxed);
+    // use CAS loop to update hotness
+    uint64_t old_arr = page->hotness[arr_idx].load(std::memory_order_relaxed);
     while(true){
         uint64_t current_val = (old_arr>>bit_shift) & 0b11ULL;
         // already reached the min hotness, do nothing
@@ -296,7 +296,7 @@ void age_a_slot(void* slot_addr){
         uint64_t new_val = current_val - 1;
         uint64_t new_arr = (old_arr & ~(0b11ULL<<bit_shift)) | (new_val << bit_shift);
 
-        if(page->is_hot[arr_idx].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){
+        if(page->hotness[arr_idx].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){
             break;
         }
     }
@@ -310,7 +310,7 @@ void mark_slot_cold(void* slot_addr){
     size_t bit_idx = slot_id % 32;
     size_t bit_shift = bit_idx*2;
 
-    page->is_hot[arr_idx].fetch_and(~(0b11ULL<<bit_shift), std::memory_order_relaxed);
+    page->hotness[arr_idx].fetch_and(~(0b11ULL<<bit_shift), std::memory_order_relaxed);
 };
 
 uint8_t get_slot_hotness(void* slot_addr){
@@ -321,7 +321,7 @@ uint8_t get_slot_hotness(void* slot_addr){
     size_t bit_idx = slot_id % 32;
     size_t bit_shift = bit_idx * 2;
 
-    uint64_t chunk = page->is_hot[arr_idx].load(std::memory_order_relaxed);
+    uint64_t chunk = page->hotness[arr_idx].load(std::memory_order_relaxed);
     uint8_t val = (chunk>>bit_shift) & 0b11ULL;
     return val;
 }
@@ -334,10 +334,10 @@ void set_slot_hotness(void* slot_addr, uint8_t exact_val){
     size_t arr_idx = slot_id / 32;
     size_t bit_shift = (slot_id % 32) * 2;
 
-    uint64_t old_arr = page->is_hot[arr_idx].load(std::memory_order_relaxed);
+    uint64_t old_arr = page->hotness[arr_idx].load(std::memory_order_relaxed);
     while (true){
         uint64_t new_arr = (old_arr & ~(0b11ULL << bit_shift)) | (static_cast<uint64_t>(exact_val) << bit_shift);
-        if (page->is_hot[arr_idx].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)) {
+        if (page->hotness[arr_idx].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)) {
             break;
         }
     }
@@ -347,7 +347,7 @@ uint16_t get_page_hot_count(Page* page) {
     uint16_t total_hot = 0;
     // no lock. 'false' value is acceptable
     for (int i = 0; i < IS_HOT_ARR_LENGTH; i++) {
-        uint64_t chunk = page->is_hot[i].load(std::memory_order_relaxed);
+        uint64_t chunk = page->hotness[i].load(std::memory_order_relaxed);
         for(size_t bit_shift=0; bit_shift<64; bit_shift+=2){
             total_hot += ((chunk>>bit_shift) & 0b11ULL);
         }
@@ -359,7 +359,7 @@ uint16_t age_and_get_page_hot_count(Page* page, uint8_t age_speed){
     uint16_t total_hot = 0;
     
     for(int i=0; i < IS_HOT_ARR_LENGTH; i++){
-        uint64_t old_arr = page->is_hot[i].load(std::memory_order_relaxed);
+        uint64_t old_arr = page->hotness[i].load(std::memory_order_relaxed);
         
         while(true){
             uint64_t new_arr = 0ULL;
@@ -375,7 +375,7 @@ uint16_t age_and_get_page_hot_count(Page* page, uint8_t age_speed){
                 new_arr |= (static_cast<uint64_t>(val) << bit_shift);
             }
             
-            if(page->is_hot[i].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){
+            if(page->hotness[i].compare_exchange_weak(old_arr, new_arr, std::memory_order_relaxed)){
                 total_hot += chunk_hot; 
                 break;
             }
@@ -386,7 +386,7 @@ uint16_t age_and_get_page_hot_count(Page* page, uint8_t age_speed){
 
 void clear_page_hot_bits(Page* page) {
     for (int i = 0; i < IS_HOT_ARR_LENGTH; i++) {
-        page->is_hot[i].store(0ULL, std::memory_order_relaxed);
+        page->hotness[i].store(0ULL, std::memory_order_relaxed);
     }
 }
 

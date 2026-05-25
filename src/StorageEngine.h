@@ -29,9 +29,12 @@ struct RecordLoc{
             union{
                 void* ram_addr;
                 size_t disk_offset;
-            }; // 8 bytes
-            uint32_t size; // 4 bytes
-            bool is_in_ram; // 1 byte
+            }; 
+            // 8 bytes
+            uint32_t size; // record real size
+            // 4 bytes
+            bool is_in_ram; 
+            // 1 byte
             // 3 bytes compiler padding
             // total 16 bytes **try to keep it small!**
         }in_use;
@@ -124,7 +127,15 @@ class StorageEngine{
         std::atomic<uint64_t> partial_page_evicted_count{0};
         std::atomic<uint64_t> ram_hit_count{0};
         std::atomic<uint64_t> ram_miss_count{0};
-        bool is_arena_critical() const { return arena.is_critical(); }
+        std::atomic<uint64_t> total_data_size_in_ram{0};
+        bool is_arena_critical() const {return arena.is_critical();}
+        double get_MAF(){
+            return ((double)(arena.get_used_page() * 4096))
+                    /
+                    (
+                        ((double)total_data_size_in_ram.load(std::memory_order_relaxed))
+                    );
+        }
 
         StorageEngine(const DBConfig &cfg = DBConfig());
 

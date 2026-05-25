@@ -22,7 +22,7 @@ This is an unsigned integer type that is designed for pointers. This type is par
 - In 64 bits systems, uintptr_t is an alias for `unsigned long int`.
 - In 32 bits systems, uintptr_t is an alias for `unsigned int`.
 
-## is_hot array in page header, not in record header
+## hotness array in page header, not in record header
 
 ## pragma pack
 #pragma pack is a compiler directive used to control the memory alignment of members within structures, unions, and classes. While proper alignment improves memory access efficiency, you may occasionally need a more compact layout to save space or satisfy specific hardware requirements.
