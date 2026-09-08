@@ -27,7 +27,7 @@ Slot availability within a page is tracked using an explicit bitmask array (`is_
 The other primary responsibility of SCM is cooperating with the background eviction subsystem. Through `quarantine_page()` and `unquarantine_page()`, SCM allows the Sweeper thread to safely isolate victim pages from frontend write paths while preventing double-free race conditions.  
 
 ### The Lifecycle of Page
-![Page Lifecycle](./images/Memory%20Page%20Management%20Flow.png)
+![Page Lifecycle](.github/images/Memory%20Page%20Management%20Flow.png)
 
 ## Design of DB Operations
 The engine support standard K-V storage interface like `put()`, `get()` and `del()`. This part explains the internal structure and mechanism that support those operations.
@@ -68,7 +68,7 @@ To prevent coarse page eviction from mis-killing active hot records, the engine 
 ### Sweeper Workflow
 The logic of sweeper is defined in `StorageEngine.cpp`, see `evict_cold_page()` and `page_hot_rescue()`. Outlined in the flowchart below:
 
-![Sweeper Workflow](./images/Sweeper-workflow.png)
+![Sweeper Workflow](.github/images/Sweeper-workflow.png)
 
 ## System Evaluation
 
