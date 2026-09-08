@@ -513,7 +513,7 @@ void StorageEngine::evict_cold_page() {
             check_page_count.fetch_add(1, std::memory_order_relaxed);
         }
 
-        /* TODO: There is a TOCTOU bug, that the victim page become empty and returned to arena before 
+        /* TODO: There was a TOCTOU bug, that the victim page become empty and returned to arena before 
          * sweeper is able to evict it. 
          * The page might has been allocated to another SCM before we are able to quarantine it.
          * The current fix is doing a double check inside scm.quarantine_page(), which is not elegant
