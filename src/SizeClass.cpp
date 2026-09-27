@@ -403,7 +403,7 @@ void set_allocated_bit(Page* page, uint16_t slot_idx){
     size_t bit_idx = slot_idx % 64;
     
     // Use release semantics so the bit is set BEFORE the thread starts writing data
-    page->is_allocated[arr_idx].fetch_or(1ULL << bit_idx, std::memory_order_release);
+    page->is_allocated[arr_idx].fetch_or(1ULL << bit_idx, std::memory_order_acquire);
 }
 
 /* Clear the reservation. Called during SCM free() */

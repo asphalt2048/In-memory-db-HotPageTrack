@@ -45,13 +45,13 @@ void* Arena::alloc_a_page_nocheck(){
     for (size_t i = 0; i < bitmap_size; i++) {
         size_t idx = (local_start + i) % bitmap_size;
         
-        uint64_t chunk = bitmap[idx].load(std::memory_order_acquire);
+        uint64_t chunk = bitmap[idx].load(std::memory_order_relaxed);
         
         while (chunk != ~0ULL) {
             int first_free_bit = __builtin_ctzll(~chunk);
             uint64_t new_chunk = chunk | (1ULL << first_free_bit);
             
-            if (bitmap[idx].compare_exchange_weak(chunk, new_chunk, std::memory_order_release, std::memory_order_relaxed)){
+            if (bitmap[idx].compare_exchange_weak(chunk, new_chunk, std::memory_order_acquire, std::memory_order_relaxed)){
                 
                 last_searched_idx.store(idx, std::memory_order_relaxed);
                 used_pages.fetch_add(1, std::memory_order_relaxed);
